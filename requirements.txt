@@ -1,0 +1,9 @@
+lxml
+pdfplumber
+PyMuPDF
+pytesseract
+openpyxl
+pandas
+pillow
+tkinterdnd2
+pyinstaller

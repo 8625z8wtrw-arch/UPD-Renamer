@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 UPD/СФ Renamer — программа для массового переименования файлов УПД и СФ.
-Автоопределение типа, сокращение ОПФ, экспорт в Excel и умный поиск сумм.
+Полная версия: Экспорт в Excel, скрытие/перемещение колонок, ставка НДС.
 """
 
 import os
@@ -13,7 +13,7 @@ from pathlib import Path
 from datetime import datetime
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, Menu
 
 # --- Drag-and-drop ---
 try:
@@ -51,7 +51,6 @@ def safe_filename(name: str, max_len: int = 120) -> str:
     return name
 
 def abbreviate_org(name: str) -> str:
-    """Заменяет длинные названия ОПФ на аббревиатуры."""
     if not name: return name
     replacements = {
         r'Общество\s+с\s+ограниченной\s+ответственностью': 'ООО',
@@ -64,7 +63,6 @@ def abbreviate_org(name: str) -> str:
     return name.strip()
 
 def shorten_counterparty(name: str, limit: int = 100) -> str:
-    """Обрезает слишком длинное название с добавлением многоточия."""
     name = abbreviate_org(name)
     if len(name) > limit:
         return name[:limit - 1].strip() + "…"
@@ -105,6 +103,12 @@ def extract_inns(text: str) -> list:
     if not matches:
         matches = re.findall(r'\b(\d{10}|\d{12})\b', text)
     return matches
+
+def parse_vat_rate(text: str) -> str:
+    m = re.search(r'(5|7|10|20|22)\s*%', text)
+    if m: return m.group(1) + "%"
+    if re.search(r'Без\s+НДС', text, re.IGNORECASE): return "Без НДС"
+    return ""
 
 def parse_xml_upd(path: Path) -> dict:
     if etree is None: return {"_error": "lxml не установлен"}
@@ -152,6 +156,11 @@ def parse_xml_upd(path: Path) -> dict:
     data["sum_vat"] = find_text(["//*[local-name()='ВсегоОпл']/*[local-name()='СтТовУчНалВсего']", "//*[local-name()='СтТовУчНалВсего']"])
     data["sum_no_vat"] = find_text(["//*[local-name()='ВсегоОпл']/*[local-name()='СтТовБезНДСВсего']", "//*[local-name()='СтТовБезНДСВсего']"])
     data["vat"] = find_text(["//*[local-name()='ВсегоОпл']/*[local-name()='СумНалВсего']/*[local-name()='СумНал']", "//*[local-name()='СумНал']"])
+    
+    data["vat_rate"] = find_text(["//*[local-name()='СтНал']", "//*[local-name()='НалСт']"])
+    if data["vat_rate"] and data["vat_rate"] not in ["Без НДС", "без НДС"]:
+        data["vat_rate"] = data["vat_rate"] + "%" if "%" not in data["vat_rate"] else data["vat_rate"]
+
     return data
 
 
@@ -185,16 +194,17 @@ def parse_pdf(path: Path) -> dict:
     data["seller_inn"] = inns[0] if inns else ""
     data["buyer_inn"] = inns[1] if len(inns) > 1 else ""
 
-    # Ищем суммы по разным шаблонам (учитывая продавцов и покупателей)
-    m = re.search(r'(?:Всего\s+к\s+оплате|Итого\s+с\s+НДС|Сумма\s+с\s+НДС)[^\d]*([\d\s]+[.,]\d{2})', text, re.IGNORECASE)
+    m = re.search(r'(?:Всего\s+к\s+оплате|Итого\s+с\s+НДС|Сумма\s+с\s+НДС|Всего\s+с\s+НДС)[^\d]*([\d\s]+[.,]\d{2})', text, re.IGNORECASE)
     data["sum_vat"] = m.group(1).strip() if m else ""
     
-    m = re.search(r'(?:Стоимость\s+без\s+НДС|Всего\s+без\s+НДС)[^\d]*([\d\s]+[.,]\d{2})', text, re.IGNORECASE)
+    m = re.search(r'(?:Стоимость\s+без\s+НДС|Всего\s+без\s+НДС|Сумма\s+без\s+НДС)[^\d]*([\d\s]+[.,]\d{2})', text, re.IGNORECASE)
     data["sum_no_vat"] = m.group(1).strip() if m else ""
     
     m = re.search(r'(?:Итого\s+)?НДС[^\d]*(?:в\s+том\s+числе\s+)?([\d\s]+[.,]\d{2})', text, re.IGNORECASE)
     if not m: m = re.search(r'Сумма\s+НДС[^\d]*([\d\s]+[.,]\d{2})', text, re.IGNORECASE)
     data["vat"] = m.group(1).strip() if m else ""
+
+    data["vat_rate"] = parse_vat_rate(text)
 
     m = re.search(r'[Пп]родавец[:\s]+([«"\w][^,\n]{3,100})', text)
     data["seller_name"] = m.group(1).strip() if m else ""
@@ -233,6 +243,7 @@ def parse_excel(path: Path) -> dict:
     data["buyer_inn"] = inns[1] if len(inns) > 1 else ""
     data["seller_name"] = data["buyer_name"] = ""
     data["sum_vat"] = data["sum_no_vat"] = data["vat"] = ""
+    data["vat_rate"] = parse_vat_rate(text)
     return data
 
 
@@ -286,11 +297,29 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Переименование УПД / СФ")
-        self.root.geometry("1350x700")
+        self.root.geometry("1400x700")
 
         self.folder = tk.StringVar()
         self.source = tk.StringVar(value="buyer")
         self.files_data = []
+        
+        # Определяем все возможные колонки
+        self.all_columns = {
+            "num": "№ п/п",
+            "old": "Старое имя",
+            "type": "Тип",
+            "sign": "Пр.",
+            "number": "№ док",
+            "date": "Дата",
+            "sum_vat": "С НДС",
+            "sum_no_vat": "Без НДС",
+            "vat": "НДС",
+            "vat_rate": "Ставка НДС",
+            "counterparty": "Контрагент",
+            "inn": "ИНН",
+            "new": "Новое имя"
+        }
+        self.visible_columns = list(self.all_columns.keys())
 
         self._build_ui()
 
@@ -306,26 +335,17 @@ class App:
         opts.pack(fill="x")
 
         ttk.Label(opts, text="Источник данных для имени:").pack(side="left")
-        # Добавил command=self.update_source для моментального пересчета при клике
         ttk.Radiobutton(opts, text="Покупатель", variable=self.source, value="buyer", command=self.update_source).pack(side="left", padx=5)
         ttk.Radiobutton(opts, text="Продавец", variable=self.source, value="seller", command=self.update_source).pack(side="left")
 
         ttk.Button(opts, text="Предпросмотр", command=self.preview).pack(side="left", padx=15)
         ttk.Button(opts, text="Авто-ширина", command=self.auto_fit_columns).pack(side="left")
 
-        columns = ("old", "type", "sign", "number", "date", "sum_vat", "sum_no_vat",
-                   "vat", "counterparty", "inn", "new")
-        headers = ["Старое имя (двойной клик - открыть)", "Тип", "Пр.", "№", "Дата", "С НДС", "Без НДС",
-                   "НДС", "Контрагент", "ИНН", "Новое имя"]
-
         frame = ttk.Frame(self.root)
         frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=20)
-        for col, head in zip(columns, headers):
-            self.tree.heading(col, text=head)
-            width = 250 if col == "new" else (200 if col == "old" else (150 if col == "counterparty" else (60 if col in ("type", "sign") else 90)))
-            self.tree.column(col, width=width, minwidth=50, stretch=True)
+        self.tree = ttk.Treeview(frame, columns=tuple(self.visible_columns), show="headings", height=20)
+        self._setup_columns()
 
         vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
@@ -338,6 +358,8 @@ class App:
         frame.columnconfigure(0, weight=1)
 
         self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<Button-3>", self._show_header_menu)      # Windows/Linux right click
+        self.tree.bind("<Control-Button-1>", self._show_header_menu) # Mac right click
 
         btns = ttk.Frame(self.root, padding=10)
         btns.pack(fill="x")
@@ -354,8 +376,34 @@ class App:
             self.root.dnd_bind("<<Drop>>", self._on_drop)
             ttk.Label(self.root, text="Можно перетащить файлы прямо в окно", foreground="gray").pack(pady=(0, 5))
 
+    def _setup_columns(self):
+        self.tree["displaycolumns"] = tuple(self.visible_columns)
+        for col in self.visible_columns:
+            self.tree.heading(col, text=self.all_columns[col])
+            width = 250 if col == "new" else (200 if col == "old" else (150 if col == "counterparty" else (60 if col in ("type", "sign", "num") else 90)))
+            self.tree.column(col, width=width, minwidth=50, stretch=True)
+
+    def _show_header_menu(self, event):
+        """Показывает контекстное меню для скрытия/показа столбцов."""
+        if self.tree.identify_region(event.x, event.y) != "heading":
+            return
+        menu = Menu(self.root, tearoff=0)
+        for col, title in self.all_columns.items():
+            var = tk.BooleanVar(value=(col in self.visible_columns))
+            menu.add_checkbutton(label=title, variable=var, command=lambda c=col, v=var: self._toggle_column(c, v.get()))
+        menu.post(event.x_root, event.y_root)
+
+    def _toggle_column(self, col, show):
+        if show and col not in self.visible_columns:
+            self.visible_columns.append(col)
+        elif not show and col in self.visible_columns:
+            self.visible_columns.remove(col)
+        
+        # Сохраняем порядок как в all_columns
+        self.visible_columns = [c for c in self.all_columns if c in self.visible_columns]
+        self.tree["displaycolumns"] = tuple(self.visible_columns)
+
     def update_source(self):
-        """Пересчитывает таблицу при переключении Покупатель/Продавец."""
         if not self.files_data: return
         for i, item in enumerate(self.tree.get_children()):
             row = self.files_data[i]
@@ -372,14 +420,17 @@ class App:
             new_name = build_new_name(row, source, row["type"])
             
             vals = list(self.tree.item(item, "values"))
-            vals[8] = counterparty
-            vals[9] = inn
-            vals[10] = new_name
+            # Обновляем контрагента, ИНН и новое имя (индексы могут меняться, поэтому ищем по названию)
+            cols = self.tree["displaycolumns"]
+            if "counterparty" in cols: vals[cols.index("counterparty")] = counterparty
+            if "inn" in cols: vals[cols.index("inn")] = inn
+            if "new" in cols: vals[cols.index("new")] = new_name
+            
             self.tree.item(item, values=vals)
             row["new_name"] = new_name
 
     def auto_fit_columns(self):
-        for col in self.tree["columns"]:
+        for col in self.tree["displaycolumns"]:
             max_len = len(self.tree.heading(col)["text"])
             for item in self.tree.get_children():
                 val = str(self.tree.set(item, col))
@@ -411,38 +462,34 @@ class App:
         exts = {".xml", ".pdf", ".xlsx", ".xls"}
         files = sorted([f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in exts])
 
-        for f in files:
+        for i, f in enumerate(files, 1):
             data = parse_file(f)
-            row = self._make_row(f, data)
+            row = self._make_row(i, f, data)
             self.files_data.append(row)
-            self.tree.insert("", "end", values=row["values"])
+            
+            # Формируем значения строго по видимым колонкам
+            vals = tuple(row.get(c, "") for c in self.visible_columns)
+            self.tree.insert("", "end", values=vals)
 
         self._update_stats()
         self.auto_fit_columns()
 
-    def _make_row(self, path: Path, data: dict) -> dict:
+    def _make_row(self, num: int, path: Path, data: dict) -> dict:
         doc_type = data.get("type", "УПД")
         row = {
-            "path": path, "type": doc_type, "sign": data.get("sign", ""),
+            "num": num, "path": path, "type": doc_type, "sign": data.get("sign", ""),
             "number": data.get("number", ""), "date": data.get("date", ""),
             "sum_vat": data.get("sum_vat", ""), "sum_no_vat": data.get("sum_no_vat", ""),
-            "vat": data.get("vat", ""), 
-            "buyer_name": data.get("buyer_name", ""),
-            "seller_name": data.get("seller_name", ""),
-            "buyer_inn": data.get("buyer_inn", ""),
-            "seller_inn": data.get("seller_inn", ""),
+            "vat": data.get("vat", ""), "vat_rate": data.get("vat_rate", ""),
+            "buyer_name": data.get("buyer_name", ""), "seller_name": data.get("seller_name", ""),
+            "buyer_inn": data.get("buyer_inn", ""), "seller_inn": data.get("seller_inn", ""),
+            "old": path.name
         }
         
         source = self.source.get()
-        counterparty = shorten_counterparty(row["buyer_name" if source == "buyer" else "seller_name"], 100)
-        inn = row["buyer_inn" if source == "buyer" else "seller_inn"]
-        new_name = build_new_name(row, source, doc_type)
-        row["new_name"] = new_name
-        
-        row["values"] = (
-            path.name, doc_type, row["sign"], row["number"], row["date"], 
-            row["sum_vat"], row["sum_no_vat"], row["vat"], counterparty, inn, new_name
-        )
+        row["counterparty"] = shorten_counterparty(row["buyer_name" if source == "buyer" else "seller_name"], 100)
+        row["inn"] = row["buyer_inn" if source == "buyer" else "seller_inn"]
+        row["new"] = build_new_name(row, source, doc_type)
         return row
 
     def _on_double_click(self, event):
@@ -450,17 +497,17 @@ class App:
         col = self.tree.identify_column(event.x)
         if not item or not col: return
         
-        col_idx = int(col.replace("#", "")) - 1
+        col_name = self.tree["displaycolumns"][int(col.replace("#", "")) - 1]
         idx = self.tree.index(item)
         
-        if col_idx == 0:
+        if col_name == "old":
             if idx < len(self.files_data): open_file(self.files_data[idx]["path"])
             return
             
-        if col_idx in (0, 10): return
+        if col_name in ("num", "new"): return
         
         x, y, w, h = self.tree.bbox(item, col)
-        value = self.tree.set(item, self.tree["columns"][col_idx])
+        value = self.tree.set(item, col_name)
 
         entry = tk.Entry(self.tree)
         entry.place(x=x, y=y, width=w, height=h)
@@ -469,36 +516,32 @@ class App:
 
         def save(_):
             new_val = entry.get()
-            self.tree.set(item, self.tree["columns"][col_idx], new_val)
+            self.tree.set(item, col_name, new_val)
             entry.destroy()
-            self._recalc_new_name(item)
+            self._recalc_new_name(item, col_name, new_val)
 
         entry.bind("<Return>", save)
         entry.bind("<FocusOut>", save)
 
-    def _recalc_new_name(self, item):
+    def _recalc_new_name(self, item, col_name, value):
         idx = self.tree.index(item)
         if idx >= len(self.files_data): return
         row = self.files_data[idx]
-        vals = self.tree.item(item, "values")
         
-        row["type"] = vals[1] 
-        row["sign"] = vals[2]
-        row["number"] = vals[3]
-        row["date"] = vals[4]
-        row["sum_vat"] = vals[5]
-        row["sum_no_vat"] = vals[6]
-        row["vat"] = vals[7]
-        # Если пользователь правит контрагента вручную, пишем это в нужное поле
-        if self.source.get() == "buyer":
-            row["buyer_name"] = vals[8]
-            row["buyer_inn"] = vals[9]
-        else:
-            row["seller_name"] = vals[8]
-            row["seller_inn"] = vals[9]
+        row[col_name] = value
+        if col_name == "counterparty":
+            if self.source.get() == "buyer": row["buyer_name"] = value
+            else: row["seller_name"] = value
+        elif col_name == "inn":
+            if self.source.get() == "buyer": row["buyer_inn"] = value
+            else: row["seller_inn"] = value
 
-        row["new_name"] = build_new_name(row, self.source.get(), row["type"])
-        self.tree.set(item, "new", row["new_name"])
+        row["new"] = build_new_name(row, self.source.get(), row["type"])
+        if "new" in self.tree["displaycolumns"]:
+            new_idx = self.tree["displaycolumns"].index("new")
+            vals = list(self.tree.item(item, "values"))
+            vals[new_idx] = row["new"]
+            self.tree.item(item, values=vals)
 
     def rename_all(self):
         if not self.files_data:
@@ -517,7 +560,8 @@ class App:
                 row = self.files_data[i]
                 old_path = row["path"]
                 if not old_path.exists(): continue
-                new_name = safe_filename(self.tree.set(item, "new"))
+                
+                new_name = safe_filename(row["new"])
                 target = unique_path(folder, new_name, old_path.suffix)
                 try:
                     old_path.rename(target)
@@ -530,7 +574,6 @@ class App:
         self.preview()
 
     def export_to_excel(self):
-        """Сохраняет таблицу в Excel."""
         if not self.files_data:
             messagebox.showinfo("Инфо", "Нет данных. Сначала нажми «Предпросмотр»")
             return
@@ -548,18 +591,16 @@ class App:
             export_data = []
             for item in self.tree.get_children():
                 vals = self.tree.item(item, "values")
-                export_data.append({
-                    "Старое имя": vals[0], "Тип": vals[1], "Признак": vals[2],
-                    "Номер": vals[3], "Дата": vals[4], "С НДС": vals[5],
-                    "Без НДС": vals[6], "НДС": vals[7], "Контрагент": vals[8],
-                    "ИНН": vals[9], "Новое имя": vals[10]
-                })
+                row_dict = {}
+                for i, col in enumerate(self.tree["displaycolumns"]):
+                    row_dict[self.all_columns[col]] = vals[i]
+                export_data.append(row_dict)
             
             df = pd.DataFrame(export_data)
             df.to_excel(filepath, index=False)
             messagebox.showinfo("Готово", f"Данные экспортированы:\n{filepath}")
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}\n(Убедитесь, что установлен pandas и openpyxl)")
 
     def rollback(self):
         folder = Path(self.folder.get())

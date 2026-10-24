@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-UPD/СФ Renamer — программа для массового переименования файлов УПД и СФ.
-Полная версия: Экспорт в Excel, скрытие/перемещение колонок, ставка НДС.
+UPD/СФ Renamer — v2.3
+Жесткий поиск сумм, учет пробелов в числах, режим отладки текста PDF.
 """
 
 import os
@@ -9,11 +9,12 @@ import sys
 import csv
 import re
 import subprocess
+import threading
 from pathlib import Path
 from datetime import datetime
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, Menu
+from tkinter import ttk, filedialog, messagebox, Menu, scrolledtext
 
 # --- Drag-and-drop ---
 try:
@@ -34,10 +35,19 @@ except ImportError:
     pdfplumber = None
 
 try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+try:
     import openpyxl
 except ImportError:
     openpyxl = None
 
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 # ============== УТИЛИТЫ ==============
 
@@ -83,9 +93,20 @@ def format_date_ddmmyyyy(raw: str) -> str:
 def to_float(s) -> float:
     if s is None: return 0.0
     if isinstance(s, (int, float)): return float(s)
-    s = str(s).replace(" ", "").replace(",", ".")
+    # Убираем все кроме цифр, точек и запятых
+    s = re.sub(r'[^\d,.]', '', str(s))
+    s = s.replace(",", ".")
     try: return float(s)
     except ValueError: return 0.0
+
+def clean_amount(s: str) -> str:
+    """Очищает строку от мусора, оставляя только цифры, пробелы, запятые и точки."""
+    if not s: return ""
+    # Оставляем только цифры, пробелы, точки и запятые
+    s = re.sub(r'[^\d\s,.]', '', s)
+    # Убираем лишние пробелы
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
 
 def open_file(path: Path):
     try:
@@ -93,7 +114,32 @@ def open_file(path: Path):
         elif sys.platform == "win32": os.startfile(str(path))
         else: subprocess.run(["xdg-open", str(path)])
     except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось открыть файл: {e}")
+        messagebox.showerror("Ошибка", f"Не удалось открыть: {e}")
+
+def open_folder(path: Path):
+    try:
+        if sys.platform == "darwin": subprocess.run(["open", str(path)])
+        elif sys.platform == "win32": os.startfile(str(path))
+        else: subprocess.run(["xdg-open", str(path)])
+    except Exception: pass
+
+def get_pdf_debug_text(path: Path) -> str:
+    text = ""
+    if fitz:
+        try:
+            doc = fitz.open(str(path))
+            for page in doc:
+                text += page.get_text("text") + "\n--- Разрыв страницы ---\n"
+            return text
+        except: pass
+    if pdfplumber:
+        try:
+            with pdfplumber.open(str(path)) as pdf:
+                for page in pdf.pages:
+                    text += (page.extract_text() or "") + "\n--- Разрыв страницы ---\n"
+            return text
+        except: pass
+    return "Не удалось извлечь текст."
 
 
 # ============== ПАРСЕРЫ ==============
@@ -112,7 +158,7 @@ def parse_vat_rate(text: str) -> str:
 
 def parse_xml_upd(path: Path) -> dict:
     if etree is None: return {"_error": "lxml не установлен"}
-    data = {}
+    data = {"type": "УПД", "sign": "1", "number": "", "date": "", "sum_vat": "", "sum_no_vat": "", "vat": "", "vat_rate": "", "seller_name": "", "seller_inn": "", "buyer_name": "", "buyer_inn": ""}
     try:
         tree = etree.parse(str(path))
         root = tree.getroot()
@@ -136,114 +182,107 @@ def parse_xml_upd(path: Path) -> dict:
         if types: xml_type = str(types[0]).upper()
     except: pass
     
-    data["type"] = "УПД" if ("УПД" in xml_type or "УПД" in path.name.upper()) else "СФ"
+    if "УПД" not in xml_type and "УПД" not in path.name.upper(): data["type"] = "СФ"
 
-    data["sign"] = find_text([
-        "//*[local-name()='СвСчФакт']/*[local-name()='ИнфПолФХЖ1']/*[local-name()='Признак']",
-        "//*[local-name()='Признак']",
-    ]) or "1"
-
-    data["number"] = find_text(["//*[local-name()='СчетФактура']/*[local-name()='НомерДок']", "//*[local-name()='НомерДок']"])
-    raw_date = find_text(["//*[local-name()='СчетФактура']/*[local-name()='ДатаДок']", "//*[local-name()='ДатаДок']"])
-    data["date"] = format_date_ddmmyyyy(raw_date)
-
+    data["sign"] = find_text(["//*[local-name()='Признак']"]) or "1"
+    data["number"] = find_text(["//*[local-name()='НомерДок']"])
+    data["date"] = format_date_ddmmyyyy(find_text(["//*[local-name()='ДатаДок']"]))
     data["seller_name"] = find_text(["//*[local-name()='СвПрод']/*[local-name()='НаимОрг']", "//*[local-name()='Продавец']/*[local-name()='НаимОрг']"])
     data["seller_inn"] = find_text(["//*[local-name()='СвПрод']/*[local-name()='ИННЮЛ']", "//*[local-name()='Продавец']/*[local-name()='ИННЮЛ']"])
-    
     data["buyer_name"] = find_text(["//*[local-name()='СвПокуп']/*[local-name()='НаимОрг']", "//*[local-name()='Покупатель']/*[local-name()='НаимОрг']"])
     data["buyer_inn"] = find_text(["//*[local-name()='СвПокуп']/*[local-name()='ИННЮЛ']", "//*[local-name()='Покупатель']/*[local-name()='ИННЮЛ']"])
-
-    data["sum_vat"] = find_text(["//*[local-name()='ВсегоОпл']/*[local-name()='СтТовУчНалВсего']", "//*[local-name()='СтТовУчНалВсего']"])
-    data["sum_no_vat"] = find_text(["//*[local-name()='ВсегоОпл']/*[local-name()='СтТовБезНДСВсего']", "//*[local-name()='СтТовБезНДСВсего']"])
-    data["vat"] = find_text(["//*[local-name()='ВсегоОпл']/*[local-name()='СумНалВсего']/*[local-name()='СумНал']", "//*[local-name()='СумНал']"])
-    
+    data["sum_vat"] = find_text(["//*[local-name()='СтТовУчНалВсего']"])
+    data["sum_no_vat"] = find_text(["//*[local-name()='СтТовБезНДСВсего']"])
+    data["vat"] = find_text(["//*[local-name()='СумНал']"])
     data["vat_rate"] = find_text(["//*[local-name()='СтНал']", "//*[local-name()='НалСт']"])
-    if data["vat_rate"] and data["vat_rate"] not in ["Без НДС", "без НДС"]:
-        data["vat_rate"] = data["vat_rate"] + "%" if "%" not in data["vat_rate"] else data["vat_rate"]
-
+    
+    if data["vat_rate"] and data["vat_rate"] not in ["Без НДС", "без НДС"] and "%" not in data["vat_rate"]:
+        data["vat_rate"] += "%"
     return data
 
 
 def parse_pdf(path: Path) -> dict:
-    if pdfplumber is None: return {"_error": "pdfplumber не установлен"}
+    if fitz is None and pdfplumber is None: 
+        return {"_error": "Не установлены библиотеки для чтения PDF"}
+    
     text = ""
-    try:
-        with pdfplumber.open(str(path)) as pdf:
-            for page in pdf.pages:
-                text += (page.extract_text() or "") + "\n"
-    except Exception as e:
-        return {"_error": f"PDF не прочитан: {e}"}
+    if fitz:
+        try:
+            doc = fitz.open(str(path))
+            for page in doc:
+                text += page.get_text("text") + " "
+        except Exception: pass
+    
+    if not text.strip() and pdfplumber:
+        try:
+            with pdfplumber.open(str(path)) as pdf:
+                for page in pdf.pages:
+                    text += (page.extract_text() or "") + " "
+                    for table in page.extract_tables():
+                        for row in table:
+                            for cell in row:
+                                if cell: text += str(cell) + " "
+        except Exception as e:
+            return {"_error": f"PDF не прочитан: {e}"}
 
-    data = {}
+    # Склеиваем все переносы и пробелы в один пробел
+    text = re.sub(r'\s+', ' ', text)
+
+    data = {"type": "УПД", "sign": "1", "number": "", "date": "", "sum_vat": "", "sum_no_vat": "", "vat": "", "vat_rate": "", "seller_name": "", "seller_inn": "", "buyer_name": "", "buyer_inn": ""}
     text_upper = text.upper()
     
-    data["type"] = "УПД" if ("УНИВЕРСАЛЬНЫЙ ПЕРЕДАТОЧНЫЙ ДОКУМЕНТ" in text_upper or "УПД" in path.name.upper()) else "СФ"
+    if "УНИВЕРСАЛЬНЫЙ ПЕРЕДАТОЧНЫЙ ДОКУМЕНТ" not in text_upper and "УПД" not in path.name.upper():
+        data["type"] = "СФ"
 
     m = re.search(r'[Пп]ризнак\s*[:\-]?\s*([12])', text)
-    data["sign"] = m.group(1) if m else "1"
+    if m: data["sign"] = m.group(1)
 
-    m = re.search(r'(?:№|Номер)\s*[:\-]?\s*([\w\-/]+)\s+от\s+(\d{2}[.\-/]\d{2}[.\-/]\d{4})', text)
+    m = re.search(r'(?:№|Номер)\s*[:\-]?\s*([\w\-/]+)\s*(?:от|ОТ)\s*(\d{2}[.\-/]\d{2}[.\-/]\d{4})', text)
     if m:
         data["number"] = m.group(1)
         data["date"] = m.group(2)
     else:
-        data["number"] = ""
-        data["date"] = ""
+        m_d = re.search(r'\b(\d{2}[.\-/]\d{2}[.\-/]\d{4})\b', text)
+        if m_d: data["date"] = m_d.group(1)
 
     inns = extract_inns(text)
-    data["seller_inn"] = inns[0] if inns else ""
-    data["buyer_inn"] = inns[1] if len(inns) > 1 else ""
+    if len(inns) > 0: data["seller_inn"] = inns[0]
+    if len(inns) > 1: data["buyer_inn"] = inns[1]
 
-    m = re.search(r'(?:Всего\s+к\s+оплате|Итого\s+с\s+НДС|Сумма\s+с\s+НДС|Всего\s+с\s+НДС)[^\d]*([\d\s]+[.,]\d{2})', text, re.IGNORECASE)
-    data["sum_vat"] = m.group(1).strip() if m else ""
+    # ЖЕСТКИЙ ПОИСК СУММ
+    # Ищем сумму с НДС
+    m = re.search(r'(?:Всего\s*к\s*оплате|Итого\s*с\s*НДС|Сумма\s*с\s*НДС|Всего\s*с\s*НДС)[^\d]{0,100}?([\d\s]{3,20}[.,]\d{2})', text, re.IGNORECASE)
+    if m: data["sum_vat"] = clean_amount(m.group(1))
     
-    m = re.search(r'(?:Стоимость\s+без\s+НДС|Всего\s+без\s+НДС|Сумма\s+без\s+НДС)[^\d]*([\d\s]+[.,]\d{2})', text, re.IGNORECASE)
-    data["sum_no_vat"] = m.group(1).strip() if m else ""
+    # Ищем сумму без НДС
+    m = re.search(r'(?:Стоимость\s*без\s*НДС|Всего\s*без\s*НДС|Сумма\s*без\s*НДС)[^\d]{0,100}?([\d\s]{3,20}[.,]\d{2})', text, re.IGNORECASE)
+    if m: data["sum_no_vat"] = clean_amount(m.group(1))
     
-    m = re.search(r'(?:Итого\s+)?НДС[^\d]*(?:в\s+том\s+числе\s+)?([\d\s]+[.,]\d{2})', text, re.IGNORECASE)
-    if not m: m = re.search(r'Сумма\s+НДС[^\d]*([\d\s]+[.,]\d{2})', text, re.IGNORECASE)
-    data["vat"] = m.group(1).strip() if m else ""
+    # Ищем НДС
+    m = re.search(r'(?:Итого\s*)?НДС[^\d]{0,30}(?:\(?[\d.,]+%\)?)?[^\d]{0,30}?([\d\s]{3,20}[.,]\d{2})', text, re.IGNORECASE)
+    if m: data["vat"] = clean_amount(m.group(1))
+
+    # Если вдруг нашли пустоту или 0,00, а есть просто "НДС" и число
+    if not data["vat"] or to_float(data["vat"]) == 0:
+        m = re.search(r'НДС[^\d]{0,100}?([\d\s]{3,20}[.,]\d{2})', text, re.IGNORECASE)
+        if m: data["vat"] = clean_amount(m.group(1))
 
     data["vat_rate"] = parse_vat_rate(text)
+
+    # Если нашли суммы, но не нашли ставку — вычисляем
+    if not data["vat_rate"] and data["vat"] and data["sum_no_vat"]:
+        v = to_float(data["vat"])
+        s = to_float(data["sum_no_vat"])
+        if s > 0:
+            rate = round((v / s) * 100)
+            if rate in (5, 7, 10, 20, 22):
+                data["vat_rate"] = f"{rate}%"
 
     m = re.search(r'[Пп]родавец[:\s]+([«"\w][^,\n]{3,100})', text)
-    data["seller_name"] = m.group(1).strip() if m else ""
+    if m: data["seller_name"] = m.group(1).strip()
     m = re.search(r'[Пп]окупатель[:\s]+([«"\w][^,\n]{3,100})', text)
-    data["buyer_name"] = m.group(1).strip() if m else ""
+    if m: data["buyer_name"] = m.group(1).strip()
 
-    return data
-
-
-def parse_excel(path: Path) -> dict:
-    if openpyxl is None: return {"_error": "openpyxl не установлен"}
-    text = ""
-    try:
-        wb = openpyxl.load_workbook(str(path), data_only=True)
-        for ws in wb.worksheets:
-            for row in ws.iter_rows(values_only=True):
-                for cell in row:
-                    if cell is not None: text += str(cell) + " "
-    except Exception as e:
-        return {"_error": f"Excel не прочитан: {e}"}
-
-    data = {}
-    data["type"] = "УПД" if ("УПД" in text.upper() or "УПД" in path.name.upper()) else "СФ"
-
-    m = re.search(r'[Пп]ризнак[:\s]*([12])', text)
-    data["sign"] = m.group(1) if m else "1"
-    m = re.search(r'№\s*([\w\-/]+)\s*от\s*(\d{2}[.\-/]\d{2}[.\-/]\d{4})', text)
-    if m:
-        data["number"] = m.group(1)
-        data["date"] = m.group(2)
-    else:
-        data["number"] = data["date"] = ""
-    
-    inns = extract_inns(text)
-    data["seller_inn"] = inns[0] if inns else ""
-    data["buyer_inn"] = inns[1] if len(inns) > 1 else ""
-    data["seller_name"] = data["buyer_name"] = ""
-    data["sum_vat"] = data["sum_no_vat"] = data["vat"] = ""
-    data["vat_rate"] = parse_vat_rate(text)
     return data
 
 
@@ -251,20 +290,14 @@ def parse_file(path: Path) -> dict:
     ext = path.suffix.lower()
     if ext == ".xml": return parse_xml_upd(path)
     if ext == ".pdf": return parse_pdf(path)
-    if ext in (".xlsx", ".xls"): return parse_excel(path)
     return {"_error": f"Формат {ext} не поддерживается"}
 
 
 # ============== ИМЯ ==============
 
 def build_new_name(row: dict, source: str, doc_type: str) -> str:
-    if source == "buyer":
-        raw_counterparty = row.get("buyer_name", "")
-        inn = row.get("buyer_inn", "")
-    else:
-        raw_counterparty = row.get("seller_name", "")
-        inn = row.get("seller_inn", "")
-        
+    raw_counterparty = row.get("buyer_name" if source == "buyer" else "seller_name", "")
+    inn = row.get("buyer_inn" if source == "buyer" else "seller_inn", "")
     counterparty = shorten_counterparty(raw_counterparty, 100)
 
     number = normalize_number(row.get("number", ""))
@@ -281,7 +314,6 @@ def build_new_name(row: dict, source: str, doc_type: str) -> str:
 
     return safe_filename(name)
 
-
 def unique_path(folder: Path, name: str, ext: str) -> Path:
     candidate = folder / f"{name}{ext}"
     i = 1
@@ -296,55 +328,65 @@ def unique_path(folder: Path, name: str, ext: str) -> Path:
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Переименование УПД / СФ")
-        self.root.geometry("1400x700")
+        self.root.title("Переименование УПД / СФ (v2.3)")
+        self.root.geometry("1250x800")
+        self.root.minsize(900, 600)
 
         self.folder = tk.StringVar()
         self.source = tk.StringVar(value="buyer")
-        self.files_data = []
+        self.search_var = tk.StringVar()
         
-        # Определяем все возможные колонки
+        self.files_data = []
+        self.filtered_data = []
+        self.is_processing = False
+        self.auto_width_on = True
+
         self.all_columns = {
-            "num": "№ п/п",
-            "old": "Старое имя",
-            "type": "Тип",
-            "sign": "Пр.",
-            "number": "№ док",
-            "date": "Дата",
-            "sum_vat": "С НДС",
-            "sum_no_vat": "Без НДС",
-            "vat": "НДС",
-            "vat_rate": "Ставка НДС",
-            "counterparty": "Контрагент",
-            "inn": "ИНН",
-            "new": "Новое имя"
+            "num": "№", "old": "Старое имя", 
+            "type": "Тип", "sign": "Пр.", "number": "№ док", "date": "Дата", 
+            "sum_vat": "Сумма с НДС", "sum_no_vat": "Без НДС", 
+            "vat": "Сумма НДС", "vat_rate": "Ставка НДС", 
+            "counterparty": "Контрагент", "inn": "ИНН", "new": "Новое имя"
         }
         self.visible_columns = list(self.all_columns.keys())
 
         self._build_ui()
+        self._setup_tags()
 
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=10)
+        # 1. Верхняя панель
+        top = ttk.Frame(self.root, padding=5)
         top.pack(fill="x")
 
         ttk.Label(top, text="Папка:").pack(side="left")
-        ttk.Entry(top, textvariable=self.folder, width=60).pack(side="left", padx=5)
+        ttk.Entry(top, textvariable=self.folder).pack(side="left", fill="x", expand=True, padx=5)
         ttk.Button(top, text="Выбрать…", command=self.choose_folder).pack(side="left")
+        ttk.Button(top, text="📂", command=self.open_current_folder, width=3).pack(side="left", padx=2)
+        ttk.Button(top, text="🛠 Текст PDF", command=self.debug_pdf).pack(side="left", padx=5)
 
-        opts = ttk.Frame(self.root, padding=(10, 0))
+        # 2. Панель настроек и поиска
+        opts = ttk.Frame(self.root, padding=(5, 5))
         opts.pack(fill="x")
 
-        ttk.Label(opts, text="Источник данных для имени:").pack(side="left")
-        ttk.Radiobutton(opts, text="Покупатель", variable=self.source, value="buyer", command=self.update_source).pack(side="left", padx=5)
+        ttk.Label(opts, text="В имя:").pack(side="left")
+        ttk.Radiobutton(opts, text="Покупатель", variable=self.source, value="buyer", command=self.update_source).pack(side="left")
         ttk.Radiobutton(opts, text="Продавец", variable=self.source, value="seller", command=self.update_source).pack(side="left")
+        
+        ttk.Button(opts, text="🔍 Предпросмотр", command=self.preview).pack(side="left", padx=10)
+        
+        ttk.Label(opts, text="|  Поиск:").pack(side="left", padx=(10, 0))
+        search_entry = ttk.Entry(opts, textvariable=self.search_var)
+        search_entry.pack(side="left", fill="x", expand=True, padx=5)
+        self.search_var.trace_add("write", self._on_search)
 
-        ttk.Button(opts, text="Предпросмотр", command=self.preview).pack(side="left", padx=15)
-        ttk.Button(opts, text="Авто-ширина", command=self.auto_fit_columns).pack(side="left")
+        ttk.Button(opts, text="↔ Авто-ширина", command=self.toggle_auto_width).pack(side="right")
+        ttk.Button(opts, text="Сброс", command=self.reset_width).pack(side="right", padx=2)
 
+        # 3. Таблица
         frame = ttk.Frame(self.root)
-        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-        self.tree = ttk.Treeview(frame, columns=tuple(self.visible_columns), show="headings", height=20)
+        self.tree = ttk.Treeview(frame, columns=tuple(self.visible_columns), show="headings", height=15, selectmode="extended")
         self._setup_columns()
 
         vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
@@ -358,35 +400,82 @@ class App:
         frame.columnconfigure(0, weight=1)
 
         self.tree.bind("<Double-1>", self._on_double_click)
-        self.tree.bind("<Button-3>", self._show_header_menu)      # Windows/Linux right click
-        self.tree.bind("<Control-Button-1>", self._show_header_menu) # Mac right click
+        self.tree.bind("<Button-3>", self._show_header_menu)
+        self.tree.bind("<Control-Button-1>", self._show_header_menu)
+        self.tree.bind("<ButtonRelease-1>", self._on_column_drag)
 
-        btns = ttk.Frame(self.root, padding=10)
+        # 4. Панель действий
+        btns = ttk.Frame(self.root, padding=5)
         btns.pack(fill="x")
-        ttk.Button(btns, text="Переименовать всё", command=self.rename_all).pack(side="left")
-        ttk.Button(btns, text="Экспорт в Excel", command=self.export_to_excel).pack(side="left", padx=10)
-        ttk.Button(btns, text="Откатить по логу", command=self.rollback).pack(side="left", padx=10)
-        ttk.Button(btns, text="Очистить", command=self.clear).pack(side="left")
+        
+        ttk.Button(btns, text="✅ Переименовать всё", command=lambda: self.rename(False)).pack(side="left")
+        ttk.Button(btns, text="Переименовать выделенные", command=lambda: self.rename(True)).pack(side="left", padx=5)
+        ttk.Button(btns, text="📊 Экспорт в Excel", command=self.export_to_excel).pack(side="left", padx=10)
+        ttk.Button(btns, text="⏪ Откат по логу", command=self.rollback).pack(side="left")
+        ttk.Button(btns, text="Очистить", command=self.clear).pack(side="right")
 
-        self.stats = ttk.Label(self.root, text="Файлов: 0  |  С НДС: 0  |  Без НДС: 0  |  НДС: 0", padding=10)
-        self.stats.pack(fill="x")
+        # 5. Статус
+        status_frame = ttk.Frame(self.root, padding=(10, 5))
+        status_frame.pack(fill="x", side="bottom")
+        
+        self.progress = ttk.Progressbar(status_frame, mode="determinate", length=200)
+        
+        self.stats = ttk.Label(status_frame, text="Файлов: 0  |  Готово к работе", font=("Arial", 11, "bold"))
+        self.stats.pack(side="left")
 
         if DND_AVAILABLE:
             self.root.drop_target_register(DND_FILES)
             self.root.dnd_bind("<<Drop>>", self._on_drop)
-            ttk.Label(self.root, text="Можно перетащить файлы прямо в окно", foreground="gray").pack(pady=(0, 5))
+            ttk.Label(self.root, text="Перетащите папку ИЛИ отдельные файлы прямо в окно", foreground="gray").pack(pady=(0, 5))
+
+    def debug_pdf(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("Инфо", "Выдели файл в таблице и нажми кнопку.")
+            return
+        
+        num_id = self.tree.item(selection[0], "iid")
+        row = next((r for r in self.files_data if str(r["num"]) == num_id), None)
+        if not row: return
+        
+        text = get_pdf_debug_text(row["path"])
+        
+        win = tk.Toplevel(self.root)
+        win.title(f"Текст PDF: {row['old']}")
+        win.geometry("800x600")
+        
+        st = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Courier", 11))
+        st.pack(fill="both", expand=True)
+        st.insert(tk.END, text)
+        st.config(state="disabled")
+
+    def _setup_tags(self):
+        self.tree.tag_configure('missing', background='#ffcccc', foreground='black') 
+        self.tree.tag_configure('warning', background='#fff3cd', foreground='black')
+        self.tree.tag_configure('even', background='#f9f9f9', foreground='black')
+        self.tree.tag_configure('odd', background='white', foreground='black')
 
     def _setup_columns(self):
         self.tree["displaycolumns"] = tuple(self.visible_columns)
         for col in self.visible_columns:
             self.tree.heading(col, text=self.all_columns[col])
-            width = 250 if col == "new" else (200 if col == "old" else (150 if col == "counterparty" else (60 if col in ("type", "sign", "num") else 90)))
-            self.tree.column(col, width=width, minwidth=50, stretch=True)
+            width = 220 if col == "new" else (160 if col == "old" else (130 if col == "counterparty" else (50 if col in ("type", "sign", "num") else 90)))
+            self.tree.column(col, width=width, minwidth=40, stretch=True)
+
+    def toggle_auto_width(self):
+        self.auto_width_on = not self.auto_width_on
+        if self.auto_width_on: self.auto_fit_columns()
+        else: self.reset_width()
+
+    def reset_width(self):
+        self._setup_columns()
+
+    def _on_column_drag(self, event):
+        if self.tree.identify_region(event.x, event.y) == "separator":
+            self.auto_width_on = False
 
     def _show_header_menu(self, event):
-        """Показывает контекстное меню для скрытия/показа столбцов."""
-        if self.tree.identify_region(event.x, event.y) != "heading":
-            return
+        if self.tree.identify_region(event.x, event.y) != "heading": return
         menu = Menu(self.root, tearoff=0)
         for col, title in self.all_columns.items():
             var = tk.BooleanVar(value=(col in self.visible_columns))
@@ -394,85 +483,125 @@ class App:
         menu.post(event.x_root, event.y_root)
 
     def _toggle_column(self, col, show):
-        if show and col not in self.visible_columns:
-            self.visible_columns.append(col)
-        elif not show and col in self.visible_columns:
-            self.visible_columns.remove(col)
-        
-        # Сохраняем порядок как в all_columns
+        if show and col not in self.visible_columns: self.visible_columns.append(col)
+        elif not show and col in self.visible_columns: self.visible_columns.remove(col)
         self.visible_columns = [c for c in self.all_columns if c in self.visible_columns]
         self.tree["displaycolumns"] = tuple(self.visible_columns)
+        self._refresh_tree()
+
+    def _on_search(self, *args):
+        query = self.search_var.get().lower()
+        self.filtered_data = []
+        for row in self.files_data:
+            if (query in row.get("counterparty", "").lower() or 
+                query in row.get("inn", "").lower() or 
+                query in row.get("number", "").lower() or
+                query in row.get("old", "").lower()):
+                self.filtered_data.append(row)
+        self._refresh_tree()
+        self._update_stats()
+
+    def _refresh_tree(self):
+        for item in self.tree.get_children(): self.tree.delete(item)
+        for i, row in enumerate(self.filtered_data):
+            self._insert_row_to_ui(row, i)
+
+    def _insert_row_to_ui(self, row, index):
+        vals = tuple(row.get(c, "") for c in self.visible_columns)
+        tag = "even" if index % 2 == 0 else "odd"
+        
+        if not row["number"] or not row["date"]: tag = "missing"
+        elif not row["sum_vat"] or not row["inn"]: tag = "warning"
+
+        self.tree.insert("", "end", values=vals, tags=(tag,), iid=str(row["num"]))
 
     def update_source(self):
         if not self.files_data: return
-        for i, item in enumerate(self.tree.get_children()):
-            row = self.files_data[i]
-            source = self.source.get()
-            
-            if source == "buyer":
-                raw_name = row.get("buyer_name", "")
-                inn = row.get("buyer_inn", "")
-            else:
-                raw_name = row.get("seller_name", "")
-                inn = row.get("seller_inn", "")
-                
-            counterparty = shorten_counterparty(raw_name, 100)
-            new_name = build_new_name(row, source, row["type"])
-            
-            vals = list(self.tree.item(item, "values"))
-            # Обновляем контрагента, ИНН и новое имя (индексы могут меняться, поэтому ищем по названию)
-            cols = self.tree["displaycolumns"]
-            if "counterparty" in cols: vals[cols.index("counterparty")] = counterparty
-            if "inn" in cols: vals[cols.index("inn")] = inn
-            if "new" in cols: vals[cols.index("new")] = new_name
-            
-            self.tree.item(item, values=vals)
-            row["new_name"] = new_name
+        source = self.source.get()
+        for row in self.files_data:
+            row["counterparty"] = shorten_counterparty(row["buyer_name" if source == "buyer" else "seller_name"], 100)
+            row["inn"] = row["buyer_inn" if source == "buyer" else "seller_inn"]
+            row["new"] = build_new_name(row, source, row["type"])
+        self._on_search()
 
-    def auto_fit_columns(self):
-        for col in self.tree["displaycolumns"]:
-            max_len = len(self.tree.heading(col)["text"])
-            for item in self.tree.get_children():
-                val = str(self.tree.set(item, col))
-                max_len = max(max_len, len(val))
-            self.tree.column(col, width=max(80, max_len * 8 + 20))
-
-    def _on_drop(self, event):
-        files = self.root.tk.splitlist(event.data)
-        if files:
-            self.folder.set(str(Path(files[0]).parent))
-            self.preview()
+    def open_current_folder(self):
+        p = Path(self.folder.get())
+        if p.exists(): open_folder(p)
 
     def choose_folder(self):
         p = filedialog.askdirectory()
         if p: self.folder.set(p)
 
     def clear(self):
-        for i in self.tree.get_children(): self.tree.delete(i)
         self.files_data = []
+        self.filtered_data = []
+        self._refresh_tree()
         self._update_stats()
 
-    def preview(self):
+    def auto_fit_columns(self):
+        if not self.auto_width_on: return
+        for col in self.tree["displaycolumns"]:
+            max_len = len(self.tree.heading(col)["text"])
+            for item in self.tree.get_children():
+                max_len = max(max_len, len(str(self.tree.set(item, col))))
+            self.tree.column(col, width=max(60, max_len * 8 + 15))
+
+    def _on_drop(self, event):
+        items = self.root.tk.splitlist(event.data)
+        if not items: return
+        
+        paths = [Path(i) for i in items]
+        dirs = [p for p in paths if p.is_dir()]
+        files = [p for p in paths if p.is_file() and p.suffix.lower() in (".pdf", ".xml", ".xlsx", ".xls")]
+        
+        if dirs:
+            self.folder.set(str(dirs[0]))
+            self.preview()
+        elif files:
+            self.folder.set(str(files[0].parent))
+            self.preview(specific_files=files)
+
+    def preview(self, specific_files=None):
+        if self.is_processing: return
         folder = Path(self.folder.get())
         if not folder.exists():
             messagebox.showerror("Ошибка", "Папка не найдена")
             return
 
         self.clear()
-        exts = {".xml", ".pdf", ".xlsx", ".xls"}
-        files = sorted([f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in exts])
+        
+        if specific_files:
+            files = sorted(specific_files)
+        else:
+            exts = {".xml", ".pdf", ".xlsx", ".xls"}
+            files = sorted([f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in exts])
+        
+        if not files:
+            messagebox.showinfo("Инфо", "Нет подходящих файлов.")
+            return
 
+        self.is_processing = True
+        self.progress["maximum"] = len(files)
+        self.progress["value"] = 0
+        self.progress.pack(side="right", padx=10)
+        
+        threading.Thread(target=self._parse_worker, args=(files,), daemon=True).start()
+
+    def _parse_worker(self, files):
         for i, f in enumerate(files, 1):
             data = parse_file(f)
             row = self._make_row(i, f, data)
             self.files_data.append(row)
-            
-            # Формируем значения строго по видимым колонкам
-            vals = tuple(row.get(c, "") for c in self.visible_columns)
-            self.tree.insert("", "end", values=vals)
+            self.root.after(0, self.progress.configure, {"value": i})
+        
+        self.root.after(0, self._finish_parsing)
 
-        self._update_stats()
-        self.auto_fit_columns()
+    def _finish_parsing(self):
+        self.is_processing = False
+        self.progress.pack_forget()
+        self._on_search()
+        if self.auto_width_on:
+            self.auto_fit_columns()
 
     def _make_row(self, num: int, path: Path, data: dict) -> dict:
         doc_type = data.get("type", "УПД")
@@ -485,7 +614,6 @@ class App:
             "buyer_inn": data.get("buyer_inn", ""), "seller_inn": data.get("seller_inn", ""),
             "old": path.name
         }
-        
         source = self.source.get()
         row["counterparty"] = shorten_counterparty(row["buyer_name" if source == "buyer" else "seller_name"], 100)
         row["inn"] = row["buyer_inn" if source == "buyer" else "seller_inn"]
@@ -498,35 +626,36 @@ class App:
         if not item or not col: return
         
         col_name = self.tree["displaycolumns"][int(col.replace("#", "")) - 1]
-        idx = self.tree.index(item)
         
         if col_name == "old":
-            if idx < len(self.files_data): open_file(self.files_data[idx]["path"])
+            num_id = self.tree.item(item, "iid")
+            for r in self.files_data:
+                if str(r["num"]) == num_id:
+                    open_file(r["path"])
+                    break
             return
             
         if col_name in ("num", "new"): return
         
         x, y, w, h = self.tree.bbox(item, col)
-        value = self.tree.set(item, col_name)
-
         entry = tk.Entry(self.tree)
         entry.place(x=x, y=y, width=w, height=h)
-        entry.insert(0, value)
+        entry.insert(0, self.tree.set(item, col_name))
         entry.focus()
 
         def save(_):
             new_val = entry.get()
             self.tree.set(item, col_name, new_val)
             entry.destroy()
-            self._recalc_new_name(item, col_name, new_val)
+            self._recalc_row(item, col_name, new_val)
 
         entry.bind("<Return>", save)
         entry.bind("<FocusOut>", save)
 
-    def _recalc_new_name(self, item, col_name, value):
-        idx = self.tree.index(item)
-        if idx >= len(self.files_data): return
-        row = self.files_data[idx]
+    def _recalc_row(self, item, col_name, value):
+        num_id = self.tree.item(item, "iid")
+        row = next((r for r in self.files_data if str(r["num"]) == num_id), None)
+        if not row: return
         
         row[col_name] = value
         if col_name == "counterparty":
@@ -542,82 +671,86 @@ class App:
             vals = list(self.tree.item(item, "values"))
             vals[new_idx] = row["new"]
             self.tree.item(item, values=vals)
+        
+        self._update_stats()
 
-    def rename_all(self):
+    def rename(self, only_selected=False):
         if not self.files_data:
             messagebox.showinfo("Инфо", "Сначала нажми «Предпросмотр»")
             return
 
+        targets = []
+        if only_selected:
+            selected_items = self.tree.selection()
+            if not selected_items:
+                messagebox.showinfo("Инфо", "Выдели строки в таблице.")
+                return
+            selected_nums = [self.tree.item(i, "iid") for i in selected_items]
+            targets = [r for r in self.files_data if str(r["num"]) in selected_nums]
+        else:
+            targets = self.files_data
+
         folder = Path(self.folder.get())
         log_path = folder / f"rename_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
-        done = 0
+        done, errors = 0, 0
 
         with open(log_path, "w", newline="", encoding="utf-8-sig") as fp:
             w = csv.writer(fp, delimiter=";")
             w.writerow(["old_name", "new_name", "date", "time"])
 
-            for i, item in enumerate(self.tree.get_children()):
-                row = self.files_data[i]
+            for row in targets:
                 old_path = row["path"]
                 if not old_path.exists(): continue
-                
                 new_name = safe_filename(row["new"])
                 target = unique_path(folder, new_name, old_path.suffix)
                 try:
                     old_path.rename(target)
                     w.writerow([old_path.name, target.name, datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%H:%M:%S")])
                     done += 1
-                except Exception as e:
-                    messagebox.showerror("Ошибка", f"{old_path.name}: {e}")
+                except Exception:
+                    errors += 1
 
-        messagebox.showinfo("Готово", f"Переименовано файлов: {done}\nЛог сохранен.")
+        messagebox.showinfo("Готово", f"Успешно: {done}\nОшибок: {errors}")
         self.preview()
 
     def export_to_excel(self):
-        if not self.files_data:
-            messagebox.showinfo("Инфо", "Нет данных. Сначала нажми «Предпросмотр»")
+        if not self.filtered_data:
+            messagebox.showinfo("Инфо", "Нет данных.")
+            return
+        if pd is None:
+            messagebox.showerror("Ошибка", "Установите pandas.")
             return
         try:
-            import pandas as pd
-            folder = Path(self.folder.get())
-            if not folder.exists(): folder = Path.home()
-            
             filepath = filedialog.asksaveasfilename(
-                initialdir=str(folder), title="Сохранить Excel",
+                initialdir=self.folder.get(), title="Сохранить Excel",
                 defaultextension=".xlsx", filetypes=[("Excel файлы", "*.xlsx")]
             )
             if not filepath: return
             
-            export_data = []
+            data = []
             for item in self.tree.get_children():
                 vals = self.tree.item(item, "values")
-                row_dict = {}
-                for i, col in enumerate(self.tree["displaycolumns"]):
-                    row_dict[self.all_columns[col]] = vals[i]
-                export_data.append(row_dict)
+                row_dict = {self.all_columns[col]: vals[i] for i, col in enumerate(self.tree["displaycolumns"])}
+                data.append(row_dict)
             
-            df = pd.DataFrame(export_data)
-            df.to_excel(filepath, index=False)
-            messagebox.showinfo("Готово", f"Данные экспортированы:\n{filepath}")
+            pd.DataFrame(data).to_excel(filepath, index=False)
+            messagebox.showinfo("Готово", f"Экспортировано:\n{filepath}")
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}\n(Убедитесь, что установлен pandas и openpyxl)")
+            messagebox.showerror("Ошибка", f"Не удалось: {e}")
 
     def rollback(self):
         folder = Path(self.folder.get())
-        if not folder.exists(): return
         logs = sorted(folder.glob("rename_log_*.csv"), reverse=True)
         if not logs:
             messagebox.showinfo("Инфо", "Логов не найдено")
             return
-        log_path = logs[0]
-
-        with open(log_path, "r", encoding="utf-8-sig") as fp:
+        
+        with open(logs[0], "r", encoding="utf-8-sig") as fp:
             rows = list(csv.reader(fp, delimiter=";"))
 
         restored = 0
         for old_name, new_name, *_ in rows[1:]:
-            new_file = folder / new_name
-            old_file = folder / old_name
+            new_file, old_file = folder / new_name, folder / old_name
             if new_file.exists() and not old_file.exists():
                 try:
                     new_file.rename(old_file)
@@ -627,12 +760,13 @@ class App:
         self.preview()
 
     def _update_stats(self):
-        n = len(self.files_data)
-        sum_vat = sum(to_float(r["sum_vat"]) for r in self.files_data)
-        sum_no_vat = sum(to_float(r["sum_no_vat"]) for r in self.files_data)
-        vat = sum(to_float(r["vat"]) for r in self.files_data)
-        self.stats.config(text=f"Файлов: {n}  |  С НДС: {sum_vat:,.2f}  |  Без НДС: {sum_no_vat:,.2f}  |  НДС: {vat:,.2f}".replace(",", " "))
-
+        sum_vat = sum(to_float(r["sum_vat"]) for r in self.filtered_data)
+        vat = sum(to_float(r["vat"]) for r in self.filtered_data)
+        
+        sum_vat_str = f"{sum_vat:,.2f}".replace(",", " ").replace(".", ",")
+        vat_str = f"{vat:,.2f}".replace(",", " ").replace(".", ",")
+        
+        self.stats.config(text=f"Показано файлов: {len(self.filtered_data)}  |  Сумма с НДС: {sum_vat_str} руб.  |  НДС: {vat_str} руб.")
 
 def main():
     root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()

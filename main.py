@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-UPD/СФ Renamer — v2.3
-Жесткий поиск сумм, учет пробелов в числах, режим отладки текста PDF.
+UPD/СФ Renamer — v4.1 (Точный поиск ИНН продавца и покупателя)
 """
 
 import os
@@ -36,8 +35,9 @@ except ImportError:
 
 try:
     import fitz  # PyMuPDF
+    FITZ_AVAILABLE = True
 except ImportError:
-    fitz = None
+    FITZ_AVAILABLE = False
 
 try:
     import openpyxl
@@ -93,20 +93,10 @@ def format_date_ddmmyyyy(raw: str) -> str:
 def to_float(s) -> float:
     if s is None: return 0.0
     if isinstance(s, (int, float)): return float(s)
-    # Убираем все кроме цифр, точек и запятых
     s = re.sub(r'[^\d,.]', '', str(s))
     s = s.replace(",", ".")
     try: return float(s)
     except ValueError: return 0.0
-
-def clean_amount(s: str) -> str:
-    """Очищает строку от мусора, оставляя только цифры, пробелы, запятые и точки."""
-    if not s: return ""
-    # Оставляем только цифры, пробелы, точки и запятые
-    s = re.sub(r'[^\d\s,.]', '', s)
-    # Убираем лишние пробелы
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s
 
 def open_file(path: Path):
     try:
@@ -125,36 +115,25 @@ def open_folder(path: Path):
 
 def get_pdf_debug_text(path: Path) -> str:
     text = ""
-    if fitz:
+    if FITZ_AVAILABLE:
         try:
             doc = fitz.open(str(path))
             for page in doc:
                 text += page.get_text("text") + "\n--- Разрыв страницы ---\n"
-            return text
-        except: pass
+            if text.strip(): return text
+        except Exception as e: pass
+    
     if pdfplumber:
         try:
             with pdfplumber.open(str(path)) as pdf:
                 for page in pdf.pages:
                     text += (page.extract_text() or "") + "\n--- Разрыв страницы ---\n"
-            return text
+            if text.strip(): return text
         except: pass
-    return "Не удалось извлечь текст."
+    return "⚠️ Не удалось извлечь текст."
 
 
 # ============== ПАРСЕРЫ ==============
-
-def extract_inns(text: str) -> list:
-    matches = re.findall(r'ИНН[^\d]{0,15}(\d{10,12})', text, re.IGNORECASE)
-    if not matches:
-        matches = re.findall(r'\b(\d{10}|\d{12})\b', text)
-    return matches
-
-def parse_vat_rate(text: str) -> str:
-    m = re.search(r'(5|7|10|20|22)\s*%', text)
-    if m: return m.group(1) + "%"
-    if re.search(r'Без\s+НДС', text, re.IGNORECASE): return "Без НДС"
-    return ""
 
 def parse_xml_upd(path: Path) -> dict:
     if etree is None: return {"_error": "lxml не установлен"}
@@ -202,11 +181,11 @@ def parse_xml_upd(path: Path) -> dict:
 
 
 def parse_pdf(path: Path) -> dict:
-    if fitz is None and pdfplumber is None: 
+    if not FITZ_AVAILABLE and not pdfplumber: 
         return {"_error": "Не установлены библиотеки для чтения PDF"}
     
     text = ""
-    if fitz:
+    if FITZ_AVAILABLE:
         try:
             doc = fitz.open(str(path))
             for page in doc:
@@ -218,14 +197,9 @@ def parse_pdf(path: Path) -> dict:
             with pdfplumber.open(str(path)) as pdf:
                 for page in pdf.pages:
                     text += (page.extract_text() or "") + " "
-                    for table in page.extract_tables():
-                        for row in table:
-                            for cell in row:
-                                if cell: text += str(cell) + " "
         except Exception as e:
             return {"_error": f"PDF не прочитан: {e}"}
 
-    # Склеиваем все переносы и пробелы в один пробел
     text = re.sub(r'\s+', ' ', text)
 
     data = {"type": "УПД", "sign": "1", "number": "", "date": "", "sum_vat": "", "sum_no_vat": "", "vat": "", "vat_rate": "", "seller_name": "", "seller_inn": "", "buyer_name": "", "buyer_inn": ""}
@@ -245,38 +219,57 @@ def parse_pdf(path: Path) -> dict:
         m_d = re.search(r'\b(\d{2}[.\-/]\d{2}[.\-/]\d{4})\b', text)
         if m_d: data["date"] = m_d.group(1)
 
-    inns = extract_inns(text)
-    if len(inns) > 0: data["seller_inn"] = inns[0]
-    if len(inns) > 1: data["buyer_inn"] = inns[1]
-
-    # ЖЕСТКИЙ ПОИСК СУММ
-    # Ищем сумму с НДС
-    m = re.search(r'(?:Всего\s*к\s*оплате|Итого\s*с\s*НДС|Сумма\s*с\s*НДС|Всего\s*с\s*НДС)[^\d]{0,100}?([\d\s]{3,20}[.,]\d{2})', text, re.IGNORECASE)
-    if m: data["sum_vat"] = clean_amount(m.group(1))
+    # --- УМНЫЙ ПОИСК ИНН ---
+    # 1. Ищем конкретно продавца (как на твоем скриншоте)
+    m_seller = re.search(r'ИНН[/\s]*КПП\s*продавца[^\d]{0,20}(\d{10,12})', text, re.IGNORECASE)
+    if m_seller: data["seller_inn"] = m_seller.group(1)
     
-    # Ищем сумму без НДС
-    m = re.search(r'(?:Стоимость\s*без\s*НДС|Всего\s*без\s*НДС|Сумма\s*без\s*НДС)[^\d]{0,100}?([\d\s]{3,20}[.,]\d{2})', text, re.IGNORECASE)
-    if m: data["sum_no_vat"] = clean_amount(m.group(1))
+    # 2. Ищем конкретно покупателя
+    m_buyer = re.search(r'ИНН[/\s]*КПП\s*покупателя[^\d]{0,20}(\d{10,12})', text, re.IGNORECASE)
+    if m_buyer: data["buyer_inn"] = m_buyer.group(1)
+
+    # 3. Если по ключевым словам не нашли, берем просто все 10-12 значные числа
+    if not data["seller_inn"] or not data["buyer_inn"]:
+        inns = re.findall(r'ИНН[^\d]{0,30}(\d{10,12})', text, re.IGNORECASE)
+        if not inns:
+            inns = re.findall(r'\b(\d{10}|\d{12})\b', text)
+        
+        if len(inns) > 0 and not data["seller_inn"]: data["seller_inn"] = inns[0]
+        if len(inns) > 1 and not data["buyer_inn"]: data["buyer_inn"] = inns[1]
+
+    # --- МАТЕМАТИЧЕСКИЙ ПОИСК СУММ ---
+    numbers = re.findall(r'(\d{1,3}(?:\s\d{3})*[.,]\d{2})', text)
+    floats = [to_float(n) for n in numbers]
     
-    # Ищем НДС
-    m = re.search(r'(?:Итого\s*)?НДС[^\d]{0,30}(?:\(?[\d.,]+%\)?)?[^\d]{0,30}?([\d\s]{3,20}[.,]\d{2})', text, re.IGNORECASE)
-    if m: data["vat"] = clean_amount(m.group(1))
+    found_math = False
+    # Перебираем комбинации А + Б = В
+    for i in range(len(floats)):
+        for j in range(i+1, len(floats)):
+            for k in range(len(floats)):
+                if i == j or i == k or j == k: continue
+                a, b, c = floats[i], floats[j], floats[k]
+                
+                if a > 0 and b > 0 and c > 0 and abs((a + b) - c) < 0.05:
+                    rate = round((b / a) * 100)
+                    if rate in (5, 7, 10, 20, 22):
+                        data["sum_no_vat"] = numbers[i]
+                        data["vat"] = numbers[j]
+                        data["sum_vat"] = numbers[k]
+                        data["vat_rate"] = f"{rate}%"
+                        found_math = True
+                        break
+            if found_math: break
+        if found_math: break
 
-    # Если вдруг нашли пустоту или 0,00, а есть просто "НДС" и число
-    if not data["vat"] or to_float(data["vat"]) == 0:
-        m = re.search(r'НДС[^\d]{0,100}?([\d\s]{3,20}[.,]\d{2})', text, re.IGNORECASE)
-        if m: data["vat"] = clean_amount(m.group(1))
-
-    data["vat_rate"] = parse_vat_rate(text)
-
-    # Если нашли суммы, но не нашли ставку — вычисляем
-    if not data["vat_rate"] and data["vat"] and data["sum_no_vat"]:
-        v = to_float(data["vat"])
-        s = to_float(data["sum_no_vat"])
-        if s > 0:
-            rate = round((v / s) * 100)
-            if rate in (5, 7, 10, 20, 22):
-                data["vat_rate"] = f"{rate}%"
+    # Если связка не найдена, ищем "Без НДС"
+    if not found_math:
+        if re.search(r'Без\s+НДС', text, re.IGNORECASE):
+            data["vat_rate"] = "Без НДС"
+            data["vat"] = "0.00"
+            m = re.search(r'(?:Всего\s*к\s*оплате|Итого)[^\d]{0,50}?([\d\s]{3,20}[.,]\d{2})', text, re.IGNORECASE)
+            if m:
+                data["sum_vat"] = re.sub(r'[^\d,.]', '', m.group(1))
+                data["sum_no_vat"] = data["sum_vat"]
 
     m = re.search(r'[Пп]родавец[:\s]+([«"\w][^,\n]{3,100})', text)
     if m: data["seller_name"] = m.group(1).strip()
@@ -328,7 +321,7 @@ def unique_path(folder: Path, name: str, ext: str) -> Path:
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Переименование УПД / СФ (v2.3)")
+        self.root.title("Переименование УПД / СФ (v4.1)")
         self.root.geometry("1250x800")
         self.root.minsize(900, 600)
 
@@ -354,7 +347,6 @@ class App:
         self._setup_tags()
 
     def _build_ui(self):
-        # 1. Верхняя панель
         top = ttk.Frame(self.root, padding=5)
         top.pack(fill="x")
 
@@ -364,7 +356,6 @@ class App:
         ttk.Button(top, text="📂", command=self.open_current_folder, width=3).pack(side="left", padx=2)
         ttk.Button(top, text="🛠 Текст PDF", command=self.debug_pdf).pack(side="left", padx=5)
 
-        # 2. Панель настроек и поиска
         opts = ttk.Frame(self.root, padding=(5, 5))
         opts.pack(fill="x")
 
@@ -382,7 +373,6 @@ class App:
         ttk.Button(opts, text="↔ Авто-ширина", command=self.toggle_auto_width).pack(side="right")
         ttk.Button(opts, text="Сброс", command=self.reset_width).pack(side="right", padx=2)
 
-        # 3. Таблица
         frame = ttk.Frame(self.root)
         frame.pack(fill="both", expand=True, padx=5, pady=5)
 
@@ -404,7 +394,6 @@ class App:
         self.tree.bind("<Control-Button-1>", self._show_header_menu)
         self.tree.bind("<ButtonRelease-1>", self._on_column_drag)
 
-        # 4. Панель действий
         btns = ttk.Frame(self.root, padding=5)
         btns.pack(fill="x")
         
@@ -414,14 +403,21 @@ class App:
         ttk.Button(btns, text="⏪ Откат по логу", command=self.rollback).pack(side="left")
         ttk.Button(btns, text="Очистить", command=self.clear).pack(side="right")
 
-        # 5. Статус
         status_frame = ttk.Frame(self.root, padding=(10, 5))
         status_frame.pack(fill="x", side="bottom")
         
         self.progress = ttk.Progressbar(status_frame, mode="determinate", length=200)
+        self.progress.pack(side="left", padx=(0, 10))
         
         self.stats = ttk.Label(status_frame, text="Файлов: 0  |  Готово к работе", font=("Arial", 11, "bold"))
         self.stats.pack(side="left")
+
+        legend_frame = ttk.Frame(status_frame)
+        legend_frame.pack(side="right")
+        
+        ttk.Label(legend_frame, text="🟢 Все ок", foreground="green", font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        ttk.Label(legend_frame, text="🟡 Мелкая помарка", foreground="#b8860b", font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        ttk.Label(legend_frame, text="🔴 Ошибка", foreground="red", font=("Arial", 10, "bold")).pack(side="left", padx=5)
 
         if DND_AVAILABLE:
             self.root.drop_target_register(DND_FILES)
@@ -429,29 +425,41 @@ class App:
             ttk.Label(self.root, text="Перетащите папку ИЛИ отдельные файлы прямо в окно", foreground="gray").pack(pady=(0, 5))
 
     def debug_pdf(self):
-        selection = self.tree.selection()
-        if not selection:
-            messagebox.showinfo("Инфо", "Выдели файл в таблице и нажми кнопку.")
-            return
-        
-        num_id = self.tree.item(selection[0], "iid")
-        row = next((r for r in self.files_data if str(r["num"]) == num_id), None)
-        if not row: return
-        
-        text = get_pdf_debug_text(row["path"])
-        
-        win = tk.Toplevel(self.root)
-        win.title(f"Текст PDF: {row['old']}")
-        win.geometry("800x600")
-        
-        st = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Courier", 11))
-        st.pack(fill="both", expand=True)
-        st.insert(tk.END, text)
-        st.config(state="disabled")
+        try:
+            selection = self.tree.selection()
+            if not selection:
+                messagebox.showwarning("Внимание", "Сначала нажмите «Предпросмотр».\n\nЗатем кликните мышкой на нужную строку в таблице, и только потом нажимайте эту кнопку.")
+                return
+            
+            num_id = selection[0]
+            row = next((r for r in self.files_data if str(r["num"]) == num_id), None)
+            if not row: return
+            
+            self.root.config(cursor="watch")
+            self.root.update()
+            
+            text = get_pdf_debug_text(row["path"])
+            
+            win = tk.Toplevel(self.root)
+            win.title(f"Текст PDF: {row['old']}")
+            win.geometry("800x600")
+            win.attributes('-topmost', True)
+            win.focus_force()
+            
+            st = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Courier", 12))
+            st.pack(fill="both", expand=True)
+            st.insert(tk.END, text)
+            st.config(state="disabled")
+            
+            self.root.config(cursor="")
+        except Exception as e:
+            self.root.config(cursor="")
+            messagebox.showerror("Ошибка", f"Не удалось открыть текст PDF:\n{e}")
 
     def _setup_tags(self):
-        self.tree.tag_configure('missing', background='#ffcccc', foreground='black') 
+        self.tree.tag_configure('error', background='#ffcccc', foreground='black')
         self.tree.tag_configure('warning', background='#fff3cd', foreground='black')
+        self.tree.tag_configure('ok', background='#d4edda', foreground='black')
         self.tree.tag_configure('even', background='#f9f9f9', foreground='black')
         self.tree.tag_configure('odd', background='white', foreground='black')
 
@@ -508,10 +516,13 @@ class App:
 
     def _insert_row_to_ui(self, row, index):
         vals = tuple(row.get(c, "") for c in self.visible_columns)
-        tag = "even" if index % 2 == 0 else "odd"
         
-        if not row["number"] or not row["date"]: tag = "missing"
-        elif not row["sum_vat"] or not row["inn"]: tag = "warning"
+        if not row["number"] or not row["date"]:
+            tag = "error"
+        elif not row["sum_vat"] or not row["inn"] or not row["counterparty"]:
+            tag = "warning"
+        else:
+            tag = "ok"
 
         self.tree.insert("", "end", values=vals, tags=(tag,), iid=str(row["num"]))
 
@@ -583,7 +594,7 @@ class App:
         self.is_processing = True
         self.progress["maximum"] = len(files)
         self.progress["value"] = 0
-        self.progress.pack(side="right", padx=10)
+        self.progress.pack(side="left", padx=(0, 10))
         
         threading.Thread(target=self._parse_worker, args=(files,), daemon=True).start()
 
@@ -628,7 +639,7 @@ class App:
         col_name = self.tree["displaycolumns"][int(col.replace("#", "")) - 1]
         
         if col_name == "old":
-            num_id = self.tree.item(item, "iid")
+            num_id = item
             for r in self.files_data:
                 if str(r["num"]) == num_id:
                     open_file(r["path"])
@@ -653,7 +664,7 @@ class App:
         entry.bind("<FocusOut>", save)
 
     def _recalc_row(self, item, col_name, value):
-        num_id = self.tree.item(item, "iid")
+        num_id = item
         row = next((r for r in self.files_data if str(r["num"]) == num_id), None)
         if not row: return
         
@@ -666,12 +677,16 @@ class App:
             else: row["seller_inn"] = value
 
         row["new"] = build_new_name(row, self.source.get(), row["type"])
-        if "new" in self.tree["displaycolumns"]:
-            new_idx = self.tree["displaycolumns"].index("new")
-            vals = list(self.tree.item(item, "values"))
-            vals[new_idx] = row["new"]
-            self.tree.item(item, values=vals)
         
+        vals = tuple(row.get(c, "") for c in self.visible_columns)
+        if not row["number"] or not row["date"]:
+            tag = "error"
+        elif not row["sum_vat"] or not row["inn"] or not row["counterparty"]:
+            tag = "warning"
+        else:
+            tag = "ok"
+            
+        self.tree.item(item, values=vals, tags=(tag,))
         self._update_stats()
 
     def rename(self, only_selected=False):
@@ -685,7 +700,7 @@ class App:
             if not selected_items:
                 messagebox.showinfo("Инфо", "Выдели строки в таблице.")
                 return
-            selected_nums = [self.tree.item(i, "iid") for i in selected_items]
+            selected_nums = list(selected_items)
             targets = [r for r in self.files_data if str(r["num"]) in selected_nums]
         else:
             targets = self.files_data

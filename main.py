@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-UPD/СФ Renamer — v4.1 (Точный поиск ИНН продавца и покупателя)
+UPD/СФ Renamer — v4.3 (Удаление адресов из названий, пробелы, перетаскивание колонок)
 """
 
 import os
@@ -53,9 +53,23 @@ except ImportError:
 
 BAD_CHARS = r'[\\/:*?"<>|]'
 
+def clean_org_name(name: str) -> str:
+    """Убирает из названия организации адреса, ИНН, КПП и лишние скобки."""
+    if not name: return name
+    # Отрезаем всё от слова Адрес
+    name = re.split(r'\s+Адрес\b', name, flags=re.IGNORECASE)[0]
+    # Отрезаем реквизиты, если они приклеились
+    for kw in ["ИНН", "КПП", "ОГРН", "ОКПО", "БИК", "р/с", "к/с"]:
+        name = re.split(r'\s+' + re.escape(kw) + r'\b', name, flags=re.IGNORECASE)[0]
+    # Убираем скобки с цифрами типа (2) в конце
+    name = re.sub(r'\s*\(\d+\)\s*$', '', name)
+    return name.strip(" ,;:-\"'«»")
+
 def safe_filename(name: str, max_len: int = 120) -> str:
-    name = re.sub(BAD_CHARS, "_", name)
-    name = name.strip().strip(".")
+    # Заменяем запрещенные символы на пробелы
+    name = re.sub(BAD_CHARS, " ", name)
+    # Убираем двойные пробелы
+    name = re.sub(r'\s+', ' ', name).strip().strip(".")
     if len(name) > max_len:
         name = name[:max_len - 1] + "…"
     return name
@@ -73,6 +87,7 @@ def abbreviate_org(name: str) -> str:
     return name.strip()
 
 def shorten_counterparty(name: str, limit: int = 100) -> str:
+    name = clean_org_name(name)
     name = abbreviate_org(name)
     if len(name) > limit:
         return name[:limit - 1].strip() + "…"
@@ -219,30 +234,21 @@ def parse_pdf(path: Path) -> dict:
         m_d = re.search(r'\b(\d{2}[.\-/]\d{2}[.\-/]\d{4})\b', text)
         if m_d: data["date"] = m_d.group(1)
 
-    # --- УМНЫЙ ПОИСК ИНН ---
-    # 1. Ищем конкретно продавца (как на твоем скриншоте)
     m_seller = re.search(r'ИНН[/\s]*КПП\s*продавца[^\d]{0,20}(\d{10,12})', text, re.IGNORECASE)
     if m_seller: data["seller_inn"] = m_seller.group(1)
-    
-    # 2. Ищем конкретно покупателя
     m_buyer = re.search(r'ИНН[/\s]*КПП\s*покупателя[^\d]{0,20}(\d{10,12})', text, re.IGNORECASE)
     if m_buyer: data["buyer_inn"] = m_buyer.group(1)
 
-    # 3. Если по ключевым словам не нашли, берем просто все 10-12 значные числа
     if not data["seller_inn"] or not data["buyer_inn"]:
         inns = re.findall(r'ИНН[^\d]{0,30}(\d{10,12})', text, re.IGNORECASE)
-        if not inns:
-            inns = re.findall(r'\b(\d{10}|\d{12})\b', text)
-        
+        if not inns: inns = re.findall(r'\b(\d{10}|\d{12})\b', text)
         if len(inns) > 0 and not data["seller_inn"]: data["seller_inn"] = inns[0]
         if len(inns) > 1 and not data["buyer_inn"]: data["buyer_inn"] = inns[1]
 
-    # --- МАТЕМАТИЧЕСКИЙ ПОИСК СУММ ---
     numbers = re.findall(r'(\d{1,3}(?:\s\d{3})*[.,]\d{2})', text)
     floats = [to_float(n) for n in numbers]
     
     found_math = False
-    # Перебираем комбинации А + Б = В
     for i in range(len(floats)):
         for j in range(i+1, len(floats)):
             for k in range(len(floats)):
@@ -261,7 +267,6 @@ def parse_pdf(path: Path) -> dict:
             if found_math: break
         if found_math: break
 
-    # Если связка не найдена, ищем "Без НДС"
     if not found_math:
         if re.search(r'Без\s+НДС', text, re.IGNORECASE):
             data["vat_rate"] = "Без НДС"
@@ -301,9 +306,9 @@ def build_new_name(row: dict, source: str, doc_type: str) -> str:
     except Exception: pass
 
     if doc_type == "УПД":
-        name = f"УПД_({row.get('sign', '1')})_№{number}_от_{date}_{sum_vat} руб._{counterparty}_{inn}"
+        name = f"УПД ({row.get('sign', '1')}) №{number} от {date} {sum_vat} руб. {counterparty} {inn}"
     else:
-        name = f"СФ_№{number}_от_{date}_{sum_vat} руб._{counterparty}_{inn}"
+        name = f"СФ №{number} от {date} {sum_vat} руб. {counterparty} {inn}"
 
     return safe_filename(name)
 
@@ -311,7 +316,7 @@ def unique_path(folder: Path, name: str, ext: str) -> Path:
     candidate = folder / f"{name}{ext}"
     i = 1
     while candidate.exists():
-        candidate = folder / f"{name}_{i}{ext}"
+        candidate = folder / f"{name} ({i}){ext}"
         i += 1
     return candidate
 
@@ -321,7 +326,7 @@ def unique_path(folder: Path, name: str, ext: str) -> Path:
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Переименование УПД / СФ (v4.1)")
+        self.root.title("Переименование УПД / СФ (v4.3)")
         self.root.geometry("1250x800")
         self.root.minsize(900, 600)
 
@@ -333,6 +338,7 @@ class App:
         self.filtered_data = []
         self.is_processing = False
         self.auto_width_on = True
+        self._drag_start_col = None
 
         self.all_columns = {
             "num": "№", "old": "Старое имя", 
@@ -389,10 +395,12 @@ class App:
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
+        self.tree.bind("<ButtonPress-1>", self._on_header_press)
+        self.tree.bind("<B1-Motion>", self._on_header_motion)
+        self.tree.bind("<ButtonRelease-1>", self._on_header_release)
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<Button-3>", self._show_header_menu)
         self.tree.bind("<Control-Button-1>", self._show_header_menu)
-        self.tree.bind("<ButtonRelease-1>", self._on_column_drag)
 
         btns = ttk.Frame(self.root, padding=5)
         btns.pack(fill="x")
@@ -423,6 +431,31 @@ class App:
             self.root.drop_target_register(DND_FILES)
             self.root.dnd_bind("<<Drop>>", self._on_drop)
             ttk.Label(self.root, text="Перетащите папку ИЛИ отдельные файлы прямо в окно", foreground="gray").pack(pady=(0, 5))
+
+    def _on_header_press(self, event):
+        region = self.tree.identify_region(event.x, event.y)
+        if region == "heading":
+            self._drag_start_col = self.tree.identify_column(event.x)
+        elif region == "separator":
+            self.auto_width_on = False
+
+    def _on_header_motion(self, event):
+        if getattr(self, '_drag_start_col', None):
+            current_col = self.tree.identify_column(event.x)
+            if current_col and current_col != self._drag_start_col:
+                idx1 = int(self._drag_start_col.replace("#", "")) - 1
+                idx2 = int(current_col.replace("#", "")) - 1
+                cols = list(self.tree["displaycolumns"])
+                
+                if 0 <= idx1 < len(cols) and 0 <= idx2 < len(cols):
+                    col_to_move = cols.pop(idx1)
+                    cols.insert(idx2, col_to_move)
+                    self.tree["displaycolumns"] = cols
+                    self.visible_columns = cols
+                    self._drag_start_col = current_col
+
+    def _on_header_release(self, event):
+        self._drag_start_col = None
 
     def debug_pdf(self):
         try:
@@ -478,10 +511,6 @@ class App:
     def reset_width(self):
         self._setup_columns()
 
-    def _on_column_drag(self, event):
-        if self.tree.identify_region(event.x, event.y) == "separator":
-            self.auto_width_on = False
-
     def _show_header_menu(self, event):
         if self.tree.identify_region(event.x, event.y) != "heading": return
         menu = Menu(self.root, tearoff=0)
@@ -515,7 +544,7 @@ class App:
             self._insert_row_to_ui(row, i)
 
     def _insert_row_to_ui(self, row, index):
-        vals = tuple(row.get(c, "") for c in self.visible_columns)
+        vals = tuple(row.get(c, "") for c in self.tree["displaycolumns"])
         
         if not row["number"] or not row["date"]:
             tag = "error"
@@ -678,7 +707,7 @@ class App:
 
         row["new"] = build_new_name(row, self.source.get(), row["type"])
         
-        vals = tuple(row.get(c, "") for c in self.visible_columns)
+        vals = tuple(row.get(c, "") for c in self.tree["displaycolumns"])
         if not row["number"] or not row["date"]:
             tag = "error"
         elif not row["sum_vat"] or not row["inn"] or not row["counterparty"]:
